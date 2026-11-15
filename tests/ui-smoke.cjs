@@ -133,6 +133,13 @@ const server = http.createServer((req, res) => {
   st = await page.evaluate(() => window.StockNote.state);
   assert.equal(st.symbols.length, 2);
 
+  // 모든 탭이 화면 폭 안에 들어오는지 (가로 넘침 시 아이폰에서 화면이 축소되고 탭바가 밀려남)
+  for (const tab of ['portfolio', 'journal', 'calc', 'watch', 'chart']) {
+    await page.click(`.tabbar [data-tab=${tab}]`);
+    const w = await page.evaluate(() => [document.documentElement.scrollWidth, window.innerWidth, visualViewport.width]);
+    assert.ok(w[0] <= w[2] + 1 && w[1] <= w[2] + 1, `${tab} 탭 가로 넘침: ${w}`);
+  }
+
   assert.deepEqual(errors, []);
   console.log('UI smoke test passed');
   await browser.close();

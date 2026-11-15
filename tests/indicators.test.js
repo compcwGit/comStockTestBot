@@ -51,3 +51,12 @@ test('analyze returns verdict, levels and signals', () => {
   assert.ok(A.signals.length > 0);
   assert.ok(['매수 우위', '약한 매수 우위'].includes(A.verdict));
 });
+
+test('all app scripts parse (syntax check)', () => {
+  const fs = require('node:fs'), path = require('node:path'), vm = require('node:vm');
+  for (const f of ['indicators.js', 'chart.js', 'app.js']) {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'js', f), 'utf8');
+    assert.doesNotThrow(() => new vm.Script(src, { filename: f }), f);
+  }
+  new vm.Script(fs.readFileSync(path.join(__dirname, '..', 'sw.js'), 'utf8'));
+});

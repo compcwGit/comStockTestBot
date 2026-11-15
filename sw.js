@@ -1,5 +1,5 @@
 /* 오프라인 캐시: 앱 파일을 저장해 두고 인터넷 없이도 실행 */
-const CACHE = 'stocknote-v1';
+const CACHE = 'stocknote-v2';
 const ASSETS = [
   './', './index.html', './style.css', './manifest.webmanifest',
   './js/indicators.js', './js/chart.js', './js/app.js',
@@ -16,18 +16,21 @@ self.addEventListener('activate', e => {
     .then(() => self.clients.claim()));
 });
 
-// 캐시 우선 + 백그라운드 갱신 (다음 실행 때 새 버전 반영)
+// 네트워크 우선: 온라인이면 항상 최신 파일, 오프라인이면 저장된 파일
 self.addEventListener('fetch', e => {
   const req = e.request;
   if (req.method !== 'GET' || new URL(req.url).origin !== location.origin) return;
-  e.respondWith(caches.open(CACHE).then(async cache => {
-    const hit = await cache.match(req, { ignoreSearch: true });
-    const net = fetch(req).then(res => {
+  e.respondWith((async () => {
+    const cache = await caches.open(CACHE);
+    try {
+      const res = await fetch(req, { cache: 'no-cache' });
       if (res && res.ok) cache.put(req, res.clone());
       return res;
-    }).catch(() => null);
-    if (hit) { e.waitUntil(net); return hit; }
-    const res = await net;
-    return res || (req.mode === 'navigate' ? cache.match('./index.html') : Response.error());
-  }));
+    } catch (err) {
+      const hit = await cache.match(req, { ignoreSearch: true });
+      if (hit) return hit;
+      if (req.mode === 'navigate') return (await cache.match('./index.html')) || Response.error();
+      return Response.error();
+    }
+  })());
 });

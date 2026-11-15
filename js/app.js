@@ -1117,7 +1117,7 @@
     }
     const last = bars[bars.length - 1];
     const sid = uid();
-    S.symbols.push({ id: sid, name: '샘플전자', code: 'DEMO', currency: 'KRW', price: last.c, priceDate: last.d, target: Math.round(last.c * 1.12 / 100) * 100, stop: Math.round(last.c * 0.92 / 100) * 100, memo: '샘플 데이터입니다. 종목을 누른 뒤 '종목 정보 수정 → 종목 삭제'로 지울 수 있어요.', watch: true, history: bars });
+    S.symbols.push({ id: sid, name: '샘플전자', code: 'DEMO', currency: 'KRW', price: last.c, priceDate: last.d, target: Math.round(last.c * 1.12 / 100) * 100, stop: Math.round(last.c * 0.92 / 100) * 100, memo: '샘플 데이터입니다. 종목을 누른 뒤 [종목 정보 수정 → 종목 삭제]로 지울 수 있어요.', watch: true, history: bars });
     const at = i => bars[i];
     const now = Date.now();
     S.trades.push(

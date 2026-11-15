@@ -20,7 +20,7 @@
 }
 
 * { box-sizing: border-box; }
-html, body { margin: 0; background: var(--bg); color: var(--fg); }
+html, body { margin: 0; background: var(--bg); color: var(--fg); overflow-x: hidden; }
 body {
   font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Noto Sans KR", "Malgun Gothic", sans-serif;
   -webkit-text-size-adjust: 100%; -webkit-tap-highlight-color: transparent;
@@ -93,9 +93,9 @@ main {
 .item .weight i { display: block; height: 4px; border-radius: 2px; background: var(--accent); opacity: .65; }
 .item .weight span { font-size: 11px; color: var(--muted); }
 .item em { font-style: normal; color: var(--warn); }
-.memo-line { font-size: 12.5px; color: var(--muted); margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 62vw; }
+.item-main, .item-side { min-width: 0; }
+.memo-line { font-size: 12.5px; color: var(--muted); margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
 .item.watch { grid-template-columns: 1fr; }
-.item.watch .memo-line { max-width: none; }
 
 .badge { display: inline-block; font-size: 11px; font-weight: 700; padding: 1px 6px; border-radius: 6px; vertical-align: 1px; }
 .badge.buy { background: color-mix(in srgb, var(--up) 15%, transparent); color: var(--up); }
@@ -250,3 +250,4 @@ pre.example { background: var(--input); border-radius: 10px; padding: 10px; font
 #ex-text, #im-text { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; margin-top: 8px; }
 .file-btn.block { width: 100%; margin-top: 4px; color: var(--fg); }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
+#fatal { position: fixed; left: 12px; right: 12px; top: calc(env(safe-area-inset-top) + 8px); z-index: 99; background: #b91c1c; color: #fff; padding: 10px 12px; border-radius: 10px; font-size: 13px; white-space: pre-wrap; }

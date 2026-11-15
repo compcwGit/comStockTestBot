@@ -39,6 +39,14 @@
   <div id="dialog-root"></div>
   <div id="toast" role="status" aria-live="polite"></div>
 
+  <script>
+    // 스크립트 오류를 화면에 표시 (원인 파악용)
+    window.addEventListener('error', function (e) {
+      var d = document.getElementById('fatal') || document.body.appendChild(document.createElement('div'));
+      d.id = 'fatal';
+      d.textContent = '오류: ' + (e.message || '알 수 없음') + (e.filename ? ' (' + e.filename.split('/').pop() + ':' + e.lineno + ')' : '');
+    });
+  </script>
   <script src="js/indicators.js"></script>
   <script src="js/chart.js"></script>
   <script src="js/app.js"></script>
