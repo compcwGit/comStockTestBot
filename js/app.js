@@ -36,8 +36,8 @@
       version: 1,
       symbols: [],
       trades: [],
-      settings: { buyFee: 0.015, sellFee: 0.015, sellTax: 0.20 },
-      ui: { tab: 'portfolio', chartSymbol: null, chartRange: 120, journalFilter: '' },
+      settings: { buyFee: 0.015, sellFee: 0.015, sellTax: 0.20, divTax: 15.4, usDivTax: 15 },
+      ui: { tab: 'portfolio', chartSymbol: null, chartRange: 120, journalFilter: '', lastSync: 0 },
     };
   }
 
@@ -50,6 +50,8 @@
       name: str(x.name, 60) || '이름 없음',
       code: str(x.code, 20),
       currency: x.currency === 'USD' ? 'USD' : 'KRW',
+      asset: x.asset === 'etf' ? 'etf' : 'stock',
+      synced: Number.isFinite(+x.synced) ? +x.synced : 0,
       price: posOrNull(x.price),
       priceDate: parseDate(x.priceDate) || '',
       target: posOrNull(x.target),
@@ -65,7 +67,7 @@
     d.trades = (Array.isArray(s.trades) ? s.trades : []).filter(t => t && t.id && ids.has(String(t.symbolId))).map(t => ({
       id: str(t.id, 40),
       symbolId: String(t.symbolId),
-      type: t.type === 'sell' ? 'sell' : 'buy',
+      type: t.type === 'sell' || t.type === 'div' ? t.type : 'buy',
       date: parseDate(t.date) || today(),
       qty: posOrNull(t.qty) || 0,
       price: posOrNull(t.price) || 0,
@@ -80,6 +82,7 @@
       if (typeof s.ui.chartSymbol === 'string') d.ui.chartSymbol = s.ui.chartSymbol;
       if (Number.isFinite(+s.ui.chartRange)) d.ui.chartRange = +s.ui.chartRange;
       if (typeof s.ui.journalFilter === 'string') d.ui.journalFilter = s.ui.journalFilter;
+      if (Number.isFinite(+s.ui.lastSync)) d.ui.lastSync = +s.ui.lastSync;
     }
     return d;
   }
@@ -114,11 +117,16 @@
   const curLabel = c => (c === 'USD' ? '해외 (USD)' : '국내 (KRW)');
 
   // ───────────────────────── 계산 ─────────────────────────
-  function feeFor(type, amount, cur) {
+  // 국내 ETF는 매도 시 증권거래세 면제. 배당/분배금은 원천징수 세금.
+  function feeFor(type, amount, cur, asset) {
     const s = S.settings;
-    const pct = type === 'buy' ? s.buyFee : s.sellFee + (cur === 'KRW' ? s.sellTax : 0);
+    let pct;
+    if (type === 'buy') pct = s.buyFee;
+    else if (type === 'div') pct = cur === 'KRW' ? s.divTax : s.usDivTax;
+    else pct = s.sellFee + (cur === 'KRW' && asset !== 'etf' ? s.sellTax : 0);
     return amount * pct / 100;
   }
+  const assetLabel = a => (a === 'etf' ? 'ETF' : '주식');
 
   // 이동평균법으로 보유수량/평단/실현손익 계산
   function computeBook(excludeId) {
@@ -127,8 +135,12 @@
       .sort((a, b) => a.date.localeCompare(b.date) || (a.created || 0) - (b.created || 0));
     for (const t of ts) {
       let p = pos.get(t.symbolId);
-      if (!p) { p = { qty: 0, cost: 0, realized: 0, sells: 0, wins: 0 }; pos.set(t.symbolId, p); }
-      if (t.type === 'buy') {
+      if (!p) { p = { qty: 0, cost: 0, realized: 0, income: 0, sells: 0, wins: 0 }; pos.set(t.symbolId, p); }
+      if (t.type === 'div') {
+        const r = t.qty * t.price - (t.fee || 0);
+        realized.set(t.id, { r, pct: null, div: true });
+        p.income += r;
+      } else if (t.type === 'buy') {
         p.qty += t.qty;
         p.cost += t.qty * t.price + (t.fee || 0);
       } else {
@@ -215,6 +227,138 @@
   const numInput = (name, label, value, extra = '') =>
     `<label>${label}<input name="${name}" inputmode="decimal" autocomplete="off" value="${value == null || value === '' ? '' : esc(value)}" ${extra}></label>`;
 
+  // ───────────────────────── 실시세 연동 ─────────────────────────
+  const hasKey = cur => { const k = Data.keys(); return cur === 'KRW' ? !!k.gov : !!k.td; };
+  const anyKey = () => { const k = Data.keys(); return !!(k.gov || k.td || k.fh); };
+  let syncing = false;
+
+  function syncTargets() {
+    const { pos } = computeBook();
+    return S.symbols.filter(s => s.code && ((pos.get(s.id) || {}).qty > 0 || s.watch || s.target || s.stop || S.ui.chartSymbol === s.id));
+  }
+
+  async function syncSymbols(list, opt = {}) {
+    if (syncing) return;
+    const todo = list.filter(s => s.code && hasKey(s.currency));
+    const skipped = list.filter(s => !s.code || !hasKey(s.currency));
+    const errs = [];
+    if (!opt.quiet) {
+      const noKr = skipped.filter(s => s.code && s.currency === 'KRW').length;
+      const noUs = skipped.filter(s => s.code && s.currency === 'USD').length;
+      if (noKr) errs.push(`국내 ${noKr}종목: 설정에서 공공데이터포털 키를 넣어주세요`);
+      if (noUs) errs.push(`해외 ${noUs}종목: 설정에서 Twelve Data 키를 넣어주세요`);
+      const noCode = skipped.filter(s => !s.code).length;
+      if (noCode && opt.explicit) errs.push(`${noCode}종목: 종목코드가 없어 건너뛰었어요`);
+    }
+    if (!todo.length) {
+      if (!opt.quiet) errs.length ? showSyncResult(0, errs) : toast('업데이트할 종목이 없어요. 종목코드를 입력해 주세요');
+      return;
+    }
+    syncing = true;
+    $$('[data-action="sync"]').forEach(b => { b.disabled = true; b.textContent = '불러오는 중…'; });
+    let ok = 0;
+    for (const s of todo) {
+      try {
+        const r = await Data.history(s, opt.full);
+        if (!r.bars.length) { errs.push(`${s.name}: 시세 데이터가 없어요 (종목코드 확인)`); continue; }
+        upsertBars(s, r.bars);
+        const lastBar = r.bars[r.bars.length - 1];
+        s.price = lastBar.c; s.priceDate = lastBar.d;   // API 시세를 현재가로 사용
+        if (r.kind) s.asset = r.kind;
+        s.synced = Date.now();
+        ok++;
+      } catch (e) {
+        errs.push(`${s.name}: ${e.message}`);
+        if (/한도|연결하지/.test(e.message)) break;
+      }
+    }
+    S.ui.lastSync = Date.now();
+    syncing = false;
+    save(); render();
+    if (opt.quiet) { if (ok) toast(`${ok}종목 시세를 업데이트했어요`); return; }
+    if (errs.length) showSyncResult(ok, errs); else toast(`${ok}종목 시세를 업데이트했어요`);
+  }
+
+  function showSyncResult(ok, errs) {
+    openSheet('시세 업데이트 결과', `
+      <p>${ok ? `${ok}종목은 업데이트했어요.` : '업데이트하지 못했어요.'}</p>
+      <ul class="err-list">${errs.map(e => `<li>${esc(e)}</li>`).join('')}</ul>
+      <button class="btn block" id="sr-set">데이터 연결 설정 열기</button>`, el => {
+      $('#sr-set', el).addEventListener('click', () => { closeSheet(); openSettings(); });
+    });
+  }
+
+  function ago(ms) {
+    if (!ms) return '';
+    const m = Math.round((Date.now() - ms) / 60000);
+    if (m < 1) return '방금';
+    if (m < 60) return `${m}분 전`;
+    if (m < 1440) return `${Math.round(m / 60)}시간 전`;
+    return `${Math.round(m / 1440)}일 전`;
+  }
+
+  function syncBar() {
+    if (!anyKey()) {
+      return `<button class="sync-hint" data-action="open-settings">설정에서 무료 API 키를 넣으면 실제 시세가 자동으로 들어와요 ›</button>`;
+    }
+    return `<div class="sync-bar"><span>${S.ui.lastSync ? `시세 업데이트: ${ago(S.ui.lastSync)}` : '시세를 아직 불러오지 않았어요'}</span>
+      <button class="btn small" data-action="sync">↻ 시세 업데이트</button></div>`;
+  }
+
+  // 검색 → 이름/코드/통화/구분 자동 입력
+  function attachSearch(el, f) {
+    const box = $('.search-box', el);
+    if (!box) return;
+    const inp = $('.sq', box), res = $('.sq-res', box);
+    const run = async () => {
+      const q = inp.value.trim();
+      if (!q) return;
+      const cur = f.currency.value;
+      if (cur === 'KRW' && !Data.keys().gov) { res.innerHTML = '<p class="hint">국내 종목 검색은 설정에서 공공데이터포털 키를 넣어야 해요. 종목명과 6자리 코드를 직접 입력해도 돼요.</p>'; return; }
+      res.innerHTML = '<p class="hint">검색 중…</p>';
+      try {
+        const list = await Data.search(q, cur);
+        if (!list.length) { res.innerHTML = '<p class="hint">검색 결과가 없어요. 통화(국내/해외)를 확인하세요.</p>'; return; }
+        res.innerHTML = list.map((x, i) => `<button type="button" class="sr-item" data-i="${i}">
+          <b>${esc(x.name)}</b> <span class="code">${esc(x.code)}</span>
+          <span class="badge ${x.asset}">${assetLabel(x.asset)}</span><small>${esc(x.market || '')}</small></button>`).join('');
+        $$('.sr-item', res).forEach(b => b.addEventListener('click', () => {
+          const x = list[+b.dataset.i];
+          f.name.value = x.name; f.code.value = x.code; f.currency.value = x.currency; f.asset.value = x.asset;
+          if (f.price && x.price && !f.price.value) f.price.value = x.price;
+          res.innerHTML = `<p class="hint">선택: ${esc(x.name)} (${esc(x.code)})</p>`;
+          f.dispatchEvent(new Event('change'));
+        }));
+      } catch (e) { res.innerHTML = `<p class="warn">${esc(e.message)}</p>`; }
+    };
+    $('.sq-go', box).addEventListener('click', run);
+    inp.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); run(); } });
+  }
+
+  const searchBox = () => `<div class="search-box">
+      <div class="search-row"><input class="sq" type="search" placeholder="종목 검색 (예: 삼성전자, KODEX, AAPL, SPY)" autocomplete="off" enterkeyhint="search">
+      <button type="button" class="btn small sq-go">검색</button></div>
+      <div class="sq-res"></div></div>`;
+
+  const symbolFields = v => `
+      <label>종목명<input name="name" maxlength="60" value="${esc(v.name)}" placeholder="예: 삼성전자 / KODEX 200"></label>
+      <div class="row3">
+        <label>종목코드<input name="code" maxlength="20" value="${esc(v.code)}" placeholder="005930 / SPY" autocapitalize="characters"></label>
+        <label>통화<select name="currency">
+          <option value="KRW" ${v.currency === 'KRW' ? 'selected' : ''}>국내(원)</option>
+          <option value="USD" ${v.currency === 'USD' ? 'selected' : ''}>해외($)</option></select></label>
+        <label>구분<select name="asset">
+          <option value="stock" ${v.asset !== 'etf' ? 'selected' : ''}>주식</option>
+          <option value="etf" ${v.asset === 'etf' ? 'selected' : ''}>ETF</option></select></label>
+      </div>`;
+
+  function newsHtml(list) {
+    if (!list.length) return '<p class="hint">최근 뉴스가 없어요.</p>';
+    return `<ul class="news">${list.map(n => `<li><a href="${esc(n.url)}" target="_blank" rel="noopener noreferrer">
+      <b>${esc(n.title)}</b><small>${esc(n.source || '')} · ${esc(new Date(n.time).toLocaleString('ko-KR', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }))}</small></a></li>`).join('')}</ul>`;
+  }
+  const linksHtml = s => `<div class="links">${Data.links(s).map(([t, u]) => `<a class="btn small" href="${esc(u)}" target="_blank" rel="noopener noreferrer">${esc(t)} ↗</a>`).join('')}</div>`;
+
   // ───────────────────────── 보유 종목 ─────────────────────────
   function viewPortfolio() {
     const { pos } = computeBook();
@@ -222,28 +366,29 @@
     for (const s of S.symbols) {
       const p = pos.get(s.id);
       if (!p) continue;
-      const g = groups[s.currency] || (groups[s.currency] = { cost: 0, value: 0, realized: 0, rows: [], unpriced: 0 });
-      g.realized += p.realized;
+      const g = groups[s.currency] || (groups[s.currency] = { cost: 0, value: 0, realized: 0, income: 0, etf: 0, rows: [], unpriced: 0 });
+      g.realized += p.realized; g.income += p.income;
       if (p.qty > 0) {
         const avg = p.cost / p.qty;
         const has = s.price > 0;
         const value = has ? s.price * p.qty : p.cost;
         if (!has) g.unpriced++;
         g.cost += p.cost; g.value += value;
+        if (s.asset === 'etf') g.etf += value;
         g.rows.push({ s, p, avg, has, value, pl: value - p.cost, pct: p.cost > 0 ? (value / p.cost - 1) * 100 : 0 });
       }
     }
 
     let h = `<div class="actions-row">
       <button class="btn primary" data-action="new-trade" data-type="buy">+ 매수 기록</button>
-      <button class="btn" data-action="new-trade" data-type="sell">매도 기록</button></div>`;
+      <button class="btn" data-action="new-trade" data-type="sell">매도 기록</button></div>` + syncBar();
 
     const any = Object.values(groups).some(g => g.rows.length);
     if (!any) {
       h += `<section class="card empty">
         <div class="empty-ico">📈</div>
         <h3>아직 보유 종목이 없어요</h3>
-        <p>매수 기록을 추가하면 평균단가, 평가손익, 수익률이 자동으로 계산돼요.</p>
+        <p>매수 기록을 추가하면 평균단가, 평가손익, 수익률이 자동으로 계산돼요. 주식과 ETF 모두 기록할 수 있어요.</p>
         <button class="btn primary" data-action="new-trade" data-type="buy">첫 매수 기록하기</button>
         <button class="btn ghost" data-action="sample">샘플 데이터로 둘러보기</button>
       </section>`;
@@ -251,18 +396,21 @@
 
     for (const cur of ['KRW', 'USD']) {
       const g = groups[cur];
-      if (!g || (!g.rows.length && !g.realized)) continue;
+      if (!g || (!g.rows.length && !g.realized && !g.income)) continue;
       const pl = g.value - g.cost, pct = g.cost > 0 ? pl / g.cost * 100 : 0;
+      const etfPct = g.value > 0 ? g.etf / g.value * 100 : 0;
       h += `<section class="card summary">
         <div class="label">${curLabel(cur)} 총 평가금액</div>
         <div class="big">${fmtMoney(g.value, cur)}</div>
         <div class="strong ${cls(pl)}">${fmtSigned(pl, cur)} (${fmtPct(pct)})</div>
         <div class="grid3">
           <div><span>매입금액</span><b>${fmtMoney(g.cost, cur)}</b></div>
-          <div><span>평가손익</span><b class="${cls(pl)}">${fmtSigned(pl, cur)}</b></div>
           <div><span>실현손익</span><b class="${cls(g.realized)}">${fmtSigned(g.realized, cur)}</b></div>
+          <div><span>배당·분배금</span><b class="${cls(g.income)}">${fmtSigned(g.income, cur)}</b></div>
         </div>
-        ${g.unpriced ? `<p class="hint">현재가를 입력하지 않은 ${g.unpriced}종목은 매입가 기준으로 계산했어요.</p>` : ''}
+        ${g.value > 0 ? `<div class="mix"><i style="width:${(100 - etfPct).toFixed(1)}%"></i><i class="etf" style="width:${etfPct.toFixed(1)}%"></i></div>
+        <div class="mix-label"><span>주식 ${(100 - etfPct).toFixed(0)}%</span><span>ETF ${etfPct.toFixed(0)}%</span></div>` : ''}
+        ${g.unpriced ? `<p class="hint">현재가가 없는 ${g.unpriced}종목은 매입가 기준으로 계산했어요.</p>` : ''}
       </section>`;
       if (!g.rows.length) continue;
       g.rows.sort((a, b) => b.value - a.value);
@@ -270,8 +418,8 @@
         const w = g.value > 0 ? r.value / g.value * 100 : 0;
         return `<button class="item" data-action="symbol" data-id="${esc(r.s.id)}">
           <div class="item-main">
-            <div class="name">${esc(r.s.name)} ${r.s.code ? `<span class="code">${esc(r.s.code)}</span>` : ''}</div>
-            <div class="sub">${fmtQty(r.p.qty)}주 · 평단 ${fmtPrice(r.avg, cur)} · 현재 ${r.has ? fmtPrice(r.s.price, cur) : '<em>미입력</em>'}</div>
+            <div class="name">${esc(r.s.name)} ${r.s.asset === 'etf' ? '<span class="badge etf">ETF</span>' : ''}${r.s.code ? `<span class="code">${esc(r.s.code)}</span>` : ''}</div>
+            <div class="sub">${fmtQty(r.p.qty)}주 · 평단 ${fmtPrice(r.avg, cur)} · 현재 ${r.has ? fmtPrice(r.s.price, cur) : '<em>미입력</em>'}${r.has && r.s.priceDate ? ` <small>(${esc(r.s.priceDate.slice(5).replace('-', '/'))})</small>` : ''}</div>
           </div>
           <div class="item-side">
             <div class="val">${fmtMoney(r.value, cur)}</div>
@@ -280,6 +428,9 @@
           <div class="weight" title="비중 ${w.toFixed(1)}%"><i style="width:${w.toFixed(1)}%"></i><span>${w.toFixed(1)}%</span></div>
         </button>`;
       }).join('') + `</section>`;
+    }
+    if (any && Object.keys(groups).includes('KRW') && Data.keys().gov) {
+      h += `<p class="hint small">국내 시세는 공공데이터포털 기준으로 전 영업일 종가예요 (장중 실시간 아님).</p>`;
     }
     return h;
   }
@@ -290,7 +441,7 @@
     const { pos } = computeBook();
     const p = pos.get(id);
     const cur = s.currency;
-    let h = '<div class="kv-list">';
+    let h = `<p class="sym-meta"><span class="badge ${s.asset}">${assetLabel(s.asset)}</span> ${cur === 'KRW' ? '국내' : '해외'}${s.code ? ` · ${esc(s.code)}` : ''}${s.synced ? ` · 시세 ${ago(s.synced)} 업데이트` : ''}</p><div class="kv-list">`;
     if (p && p.qty > 0) {
       const avg = p.cost / p.qty;
       h += kv('보유수량', fmtQty(p.qty) + '주') + kv('평균단가', fmtPrice(avg, cur)) + kv('매입금액', fmtMoney(p.cost, cur));
@@ -299,31 +450,47 @@
         h += kv('평가금액', fmtMoney(val, cur)) + kv('평가손익', `<span class="${cls(pl)}">${fmtSigned(pl, cur)} (${fmtPct(pl / p.cost * 100)})</span>`);
       }
     }
-    h += kv('현재가', s.price > 0 ? `${fmtPrice(s.price, cur)} <small>${esc(s.priceDate || '')}</small>` : '미입력');
+    const last = s.history[s.history.length - 1], prev = s.history[s.history.length - 2];
+    const chg = last && prev && last.d === s.priceDate ? (last.c / prev.c - 1) * 100 : null;
+    h += kv('현재가', s.price > 0 ? `${fmtPrice(s.price, cur)}${chg != null ? ` <small class="${cls(chg)}">${fmtPct(chg)}</small>` : ''} <small>${esc(s.priceDate || '')}</small>` : '미입력');
     if (s.target) h += kv('목표가', `${fmtPrice(s.target, cur)}${s.price ? ` <small class="${cls(s.target - s.price)}">${fmtPct((s.target / s.price - 1) * 100)}</small>` : ''}`);
     if (s.stop) h += kv('손절가', `${fmtPrice(s.stop, cur)}${s.price ? ` <small class="${cls(s.stop - s.price)}">${fmtPct((s.stop / s.price - 1) * 100)}</small>` : ''}`);
     if (p && p.sells) h += kv('실현손익', `<span class="${cls(p.realized)}">${fmtSigned(p.realized, cur)}</span>`);
+    if (p && p.income) h += kv('배당·분배금 (세후)', `<span class="${cls(p.income)}">${fmtSigned(p.income, cur)}</span>`);
     h += '</div>';
     if (s.memo) h += `<p class="memo">${esc(s.memo)}</p>`;
     h += `<div class="btn-grid">
-      <button class="btn primary" data-sa="price">현재가 입력</button>
+      <button class="btn primary" data-sa="sync">최신 시세 불러오기</button>
+      <button class="btn" data-sa="price">현재가 직접 입력</button>
       <button class="btn" data-sa="buy">매수 기록</button>
       <button class="btn" data-sa="sell">매도 기록</button>
+      <button class="btn" data-sa="div">${s.asset === 'etf' ? '분배금' : '배당금'} 기록</button>
       <button class="btn" data-sa="calc">물타기 계산</button>
       <button class="btn" data-sa="chart">차트 분석</button>
       <button class="btn" data-sa="edit">종목 정보 수정</button>
-    </div>`;
-    openSheet(s.name + (s.code ? ` (${s.code})` : ''), h, el => {
+    </div>
+    <h3>공시 · 뉴스</h3>
+    ${linksHtml(s)}
+    <div id="sym-news">${cur === 'USD'
+      ? (Data.keys().fh ? '<p class="hint">뉴스 불러오는 중…</p>' : '<p class="hint">설정에서 Finnhub 키를 넣으면 최근 2주 뉴스를 여기서 바로 볼 수 있어요.</p>')
+      : '<p class="hint">국내 공시(DART)와 뉴스는 무료 API가 브라우저 접근을 막아서, 위 바로가기로 열어요.</p>'}</div>`;
+    openSheet(s.name, h, el => {
       el.addEventListener('click', e => {
         const b = e.target.closest('[data-sa]');
         if (!b) return;
         const a = b.dataset.sa;
-        if (a === 'price') openPriceSheet(id);
-        else if (a === 'buy' || a === 'sell') openTradeForm({ type: a, symbolId: id });
+        if (a === 'sync') { closeSheet(); syncSymbols([s], { explicit: true }); }
+        else if (a === 'price') openPriceSheet(id);
+        else if (a === 'buy' || a === 'sell' || a === 'div') openTradeForm({ type: a, symbolId: id });
         else if (a === 'calc') { closeSheet(); prefillCalc(id); go('calc'); }
         else if (a === 'chart') { S.ui.chartSymbol = id; closeSheet(); go('chart'); }
         else if (a === 'edit') openSymbolForm(id);
       });
+      if (cur === 'USD' && s.code && Data.keys().fh) {
+        Data.usNews(s.code, Data.keys().fh)
+          .then(list => { const n = $('#sym-news', el); if (n) n.innerHTML = newsHtml(list); })
+          .catch(err => { const n = $('#sym-news', el); if (n) n.innerHTML = `<p class="warn">${esc(err.message)}</p>`; });
+      }
     });
   }
   const kv = (k, v) => `<div class="kv"><span>${k}</span><b>${v}</b></div>`;
@@ -351,15 +518,10 @@
 
   function openSymbolForm(id, preset = {}) {
     const s = id ? sym(id) : null;
-    const v = s || { name: '', code: '', currency: 'KRW', price: null, target: null, stop: null, memo: '', watch: !!preset.watch };
+    const v = s || { name: '', code: '', currency: 'KRW', asset: 'stock', price: null, target: null, stop: null, memo: '', watch: !!preset.watch };
     openSheet(s ? '종목 정보 수정' : '종목 추가', `<form class="form" id="sf">
-      <label>종목명<input name="name" required maxlength="60" value="${esc(v.name)}" placeholder="예: 삼성전자"></label>
-      <div class="row2">
-        <label>종목코드<input name="code" maxlength="20" value="${esc(v.code)}" placeholder="005930 / AAPL"></label>
-        <label>통화<select name="currency">
-          <option value="KRW" ${v.currency === 'KRW' ? 'selected' : ''}>원 (KRW)</option>
-          <option value="USD" ${v.currency === 'USD' ? 'selected' : ''}>달러 (USD)</option></select></label>
-      </div>
+      ${s ? '' : searchBox()}
+      ${symbolFields(v)}
       ${numInput('price', '현재가', v.price || '')}
       <div class="row2">${numInput('target', '목표가', v.target || '')}${numInput('stop', '손절가', v.stop || '')}</div>
       <label>메모<textarea name="memo" rows="3" maxlength="2000" placeholder="관심 이유, 체크할 이벤트 등">${esc(v.memo)}</textarea></label>
@@ -368,20 +530,23 @@
       ${s ? '<button type="button" class="btn danger block" id="sf-del">종목 삭제</button>' : ''}
     </form>`, el => {
       const f = $('#sf', el);
+      attachSearch(el, f);
       f.addEventListener('submit', e => {
         e.preventDefault();
         const name = f.name.value.trim();
         if (!name) return toast('종목명을 입력해 주세요');
-        const t = s || { id: uid(), history: [], priceDate: '' };
+        const t = s || { id: uid(), history: [], priceDate: '', synced: 0 };
         const price = posOrNull(num(f.price.value));
         if (price !== t.price) t.priceDate = price ? today() : '';
+        const codeChanged = (t.code || '') !== f.code.value.trim().toUpperCase();
         Object.assign(t, {
-          name, code: f.code.value.trim(), currency: f.currency.value,
+          name, code: f.code.value.trim().toUpperCase(), currency: f.currency.value, asset: f.asset.value,
           price, target: posOrNull(num(f.target.value)), stop: posOrNull(num(f.stop.value)),
           memo: f.memo.value, watch: f.watch.checked,
         });
         if (!s) S.symbols.push(t);
         save(); closeSheet(); render(); toast('저장했어요');
+        if (t.code && codeChanged && hasKey(t.currency)) syncSymbols([t], { quiet: true });
       });
       const del = $('#sf-del', el);
       if (del) del.addEventListener('click', async () => {
@@ -395,31 +560,31 @@
   }
 
   // ───────────────────────── 매매 기록 ─────────────────────────
+  const TYPE_LABEL = { buy: '매수', sell: '매도', div: '배당' };
   function openTradeForm(o = {}) {
     const t = o.id ? S.trades.find(x => x.id === o.id) : null;
     const type = t ? t.type : (o.type || 'buy');
     const symbolId = t ? t.symbolId : (o.symbolId || (S.symbols[0] && S.symbols[0].id) || '__new');
-    const opts = S.symbols.map(s => `<option value="${esc(s.id)}" ${s.id === symbolId ? 'selected' : ''}>${esc(s.name)}${s.code ? ' (' + esc(s.code) + ')' : ''}</option>`).join('');
-    openSheet(t ? '매매 기록 수정' : (type === 'buy' ? '매수 기록' : '매도 기록'), `<form class="form" id="tf">
+    const opts = S.symbols.map(s => `<option value="${esc(s.id)}" ${s.id === symbolId ? 'selected' : ''}>${esc(s.name)}${s.asset === 'etf' ? ' [ETF]' : ''}${s.code ? ' (' + esc(s.code) + ')' : ''}</option>`).join('');
+    const title = t ? '매매 기록 수정' : type === 'div' ? '배당·분배금 기록' : type === 'buy' ? '매수 기록' : '매도 기록';
+    openSheet(title, `<form class="form" id="tf">
       <div class="seg">
         <label><input type="radio" name="type" value="buy" ${type === 'buy' ? 'checked' : ''}><span>매수</span></label>
         <label><input type="radio" name="type" value="sell" ${type === 'sell' ? 'checked' : ''}><span>매도</span></label>
+        <label><input type="radio" name="type" value="div" ${type === 'div' ? 'checked' : ''}><span>배당·분배금</span></label>
       </div>
       <label>종목<select name="symbol">${opts}<option value="__new" ${symbolId === '__new' ? 'selected' : ''}>+ 새 종목 추가</option></select></label>
       <div class="newsym" id="tf-new">
-        <label>종목명<input name="name" maxlength="60" placeholder="예: 삼성전자"></label>
-        <div class="row2">
-          <label>종목코드<input name="code" maxlength="20" placeholder="005930 / AAPL"></label>
-          <label>통화<select name="currency"><option value="KRW">원 (KRW)</option><option value="USD">달러 (USD)</option></select></label>
-        </div>
+        ${searchBox()}
+        ${symbolFields({ name: '', code: '', currency: 'KRW', asset: 'stock' })}
       </div>
       <div class="row2">
         <label>날짜<input type="date" name="date" value="${t ? t.date : today()}" required></label>
-        ${numInput('qty', '수량', t ? t.qty : '', 'required')}
+        <label><span id="l-qty">수량</span><input name="qty" inputmode="decimal" autocomplete="off" value="${t ? esc(t.qty) : ''}" required></label>
       </div>
       <div class="row2">
-        ${numInput('price', '단가', t ? t.price : '', 'required')}
-        ${numInput('fee', '수수료·세금', t ? +t.fee.toFixed(4) : '', 'placeholder="비우면 자동"')}
+        <label><span id="l-price">단가</span><input name="price" inputmode="decimal" autocomplete="off" value="${t ? esc(t.price) : ''}" required></label>
+        <label><span id="l-fee">수수료·세금</span><input name="fee" inputmode="decimal" autocomplete="off" value="${t ? +t.fee.toFixed(4) : ''}" placeholder="비우면 자동"></label>
       </div>
       <p class="hint" id="tf-hint"></p>
       <label>메모 (매매 이유·복기)<textarea name="memo" rows="3" maxlength="2000" placeholder="예: 20일선 지지 확인 후 분할매수">${t ? esc(t.memo) : ''}</textarea></label>
@@ -428,21 +593,35 @@
     </form>`, el => {
       const f = $('#tf', el);
       const book = computeBook(t && t.id);
-      const curOf = () => (f.symbol.value === '__new' ? f.currency.value : (sym(f.symbol.value) || {}).currency || 'KRW');
+      attachSearch(el, f);
+      const selSym = () => (f.symbol.value === '__new' ? null : sym(f.symbol.value));
+      const curOf = () => { const s = selSym(); return s ? s.currency : f.currency.value; };
+      const assetOf = () => { const s = selSym(); return s ? s.asset : f.asset.value; };
+      let lastType = f.type.value;
       const update = () => {
         $('#tf-new', el).style.display = f.symbol.value === '__new' ? '' : 'none';
-        const ty = f.type.value, cur = curOf();
+        const ty = f.type.value, cur = curOf(), asset = assetOf();
+        const held = f.symbol.value !== '__new' && book.pos.get(f.symbol.value);
+        const isDiv = ty === 'div';
+        $('#l-qty', el).textContent = isDiv ? '보유수량 (주)' : '수량';
+        $('#l-price', el).textContent = isDiv ? `주당 ${asset === 'etf' ? '분배금' : '배당금'}` : '단가';
+        $('#l-fee', el).textContent = isDiv ? '세금 (원천징수)' : '수수료·세금';
+        if (isDiv && lastType !== 'div' && !f.qty.value && held && held.qty > 0) f.qty.value = held.qty;
+        lastType = ty;
         const q = num(f.qty.value), p = num(f.price.value);
         const parts = [];
-        const held = f.symbol.value !== '__new' && book.pos.get(f.symbol.value);
         if (held && held.qty > 0) parts.push(`현재 보유 ${fmtQty(held.qty)}주 · 평단 ${fmtPrice(held.cost / held.qty, cur)}`);
         if (q > 0 && p > 0) {
-          const amt = q * p, fee = Number.isFinite(num(f.fee.value)) ? num(f.fee.value) : feeFor(ty, amt, cur);
-          parts.push(`거래금액 ${fmtMoney(amt, cur)} · 비용 ${fmtMoney(fee, cur)}`);
-          if (ty === 'sell' && held && held.qty > 0) {
-            const avg = held.cost / held.qty, qq = Math.min(q, held.qty);
-            const r = p * qq - fee * (qq / q) - avg * qq;
-            parts.push(`예상 실현손익 <b class="${cls(r)}">${fmtSigned(r, cur)} (${fmtPct(r / (avg * qq) * 100)})</b>`);
+          const amt = q * p, fee = Number.isFinite(num(f.fee.value)) ? num(f.fee.value) : feeFor(ty, amt, cur, asset);
+          if (isDiv) {
+            parts.push(`세전 ${fmtMoney(amt, cur)} · 세금 ${fmtMoney(fee, cur)} · <b class="up">세후 수령 ${fmtMoney(amt - fee, cur)}</b>`);
+          } else {
+            parts.push(`거래금액 ${fmtMoney(amt, cur)} · 비용 ${fmtMoney(fee, cur)}${ty === 'sell' && cur === 'KRW' && asset === 'etf' ? ' (국내 ETF 거래세 면제)' : ''}`);
+            if (ty === 'sell' && held && held.qty > 0) {
+              const avg = held.cost / held.qty, qq = Math.min(q, held.qty);
+              const r = p * qq - fee * (qq / q) - avg * qq;
+              parts.push(`예상 실현손익 <b class="${cls(r)}">${fmtSigned(r, cur)} (${fmtPct(r / (avg * qq) * 100)})</b>`);
+            }
           }
         }
         $('#tf-hint', el).innerHTML = parts.join('<br>');
@@ -454,18 +633,18 @@
       f.addEventListener('submit', async e => {
         e.preventDefault();
         const q = num(f.qty.value), p = num(f.price.value);
+        const ty = f.type.value;
         if (!(q > 0)) return toast('수량을 확인해 주세요');
-        if (!(p > 0)) return toast('단가를 확인해 주세요');
+        if (!(p > 0)) return toast(ty === 'div' ? '주당 금액을 확인해 주세요' : '단가를 확인해 주세요');
         let sid = f.symbol.value, s;
         if (sid === '__new') {
           const name = f.name.value.trim();
           if (!name) return toast('종목명을 입력해 주세요');
-          s = { id: uid(), name, code: f.code.value.trim(), currency: f.currency.value, price: null, priceDate: '', target: null, stop: null, memo: '', watch: false, history: [] };
+          s = { id: uid(), name, code: f.code.value.trim().toUpperCase(), currency: f.currency.value, asset: f.asset.value, price: null, priceDate: '', target: null, stop: null, memo: '', watch: false, history: [], synced: 0 };
           S.symbols.push(s); sid = s.id;
         } else s = sym(sid);
-        const ty = f.type.value;
         const feeIn = num(f.fee.value);
-        const fee = Number.isFinite(feeIn) && feeIn >= 0 ? feeIn : feeFor(ty, q * p, s.currency);
+        const fee = Number.isFinite(feeIn) && feeIn >= 0 ? feeIn : feeFor(ty, q * p, s.currency, s.asset);
         const held = book.pos.get(sid);
         if (ty === 'sell' && (!held || q > held.qty + 1e-9)) {
           if (!(await ask(`보유수량(${fmtQty(held ? held.qty : 0)}주)보다 많이 매도합니다. 초과분은 손익 계산에서 제외돼요. 계속할까요?`, '계속'))) return;
@@ -473,8 +652,9 @@
         const rec = t || { id: uid(), created: Date.now() };
         Object.assign(rec, { symbolId: sid, type: ty, date: parseDate(f.date.value) || today(), qty: q, price: p, fee, memo: f.memo.value });
         if (!t) S.trades.push(rec);
-        if (!s.price) { s.price = p; s.priceDate = rec.date; }
+        if (!s.price && ty !== 'div') { s.price = p; s.priceDate = rec.date; }
         save(); closeSheet(); render(); toast(t ? '수정했어요' : '기록했어요');
+        if (f.symbol.value === '__new' && s.code && hasKey(s.currency)) syncSymbols([s], { quiet: true });
       });
       const del = $('#tf-del', el);
       if (del) del.addEventListener('click', async () => {
@@ -496,11 +676,12 @@
     const month = today().slice(0, 7);
     const st = {};
     for (const t of list) {
-      if (t.type !== 'sell') continue;
+      if (t.type === 'buy') continue;
       const r = realized.get(t.id);
       if (!r) continue;
       const cur = (sym(t.symbolId) || {}).currency || 'KRW';
-      const g = st[cur] || (st[cur] = { total: 0, month: 0, n: 0, wins: 0 });
+      const g = st[cur] || (st[cur] = { total: 0, month: 0, n: 0, wins: 0, income: 0 });
+      if (t.type === 'div') { g.income += r.r; if (t.date.startsWith(month)) g.month += r.r; continue; }
       g.total += r.r; g.n++; if (r.r > 0) g.wins++;
       if (t.date.startsWith(month)) g.month += r.r;
     }
@@ -508,6 +689,7 @@
     let h = `<div class="actions-row">
       <button class="btn primary" data-action="new-trade" data-type="buy">+ 매수</button>
       <button class="btn primary alt" data-action="new-trade" data-type="sell">+ 매도</button>
+      <button class="btn" data-action="new-trade" data-type="div">+ 배당</button>
       <select data-action="journal-filter" aria-label="종목 필터"><option value="">전체 종목</option>
         ${S.symbols.map(s => `<option value="${esc(s.id)}" ${s.id === f ? 'selected' : ''}>${esc(s.name)}</option>`).join('')}</select>
     </div>`;
@@ -519,9 +701,9 @@
         <div class="label">${curLabel(cur)} 실현손익</div>
         <div class="big ${cls(g.total)}">${fmtSigned(g.total, cur)}</div>
         <div class="grid3">
-          <div><span>이번 달</span><b class="${cls(g.month)}">${fmtSigned(g.month, cur)}</b></div>
-          <div><span>매도 횟수</span><b>${g.n}회</b></div>
-          <div><span>승률</span><b>${g.n ? (g.wins / g.n * 100).toFixed(0) : 0}%</b></div>
+          <div><span>이번 달 (배당 포함)</span><b class="${cls(g.month)}">${fmtSigned(g.month, cur)}</b></div>
+          <div><span>매도 / 승률</span><b>${g.n}회 · ${g.n ? (g.wins / g.n * 100).toFixed(0) : 0}%</b></div>
+          <div><span>배당·분배금</span><b class="${cls(g.income)}">${fmtSigned(g.income, cur)}</b></div>
         </div></section>`;
     }
 
@@ -544,13 +726,13 @@
       const r = realized.get(t.id);
       h += `<button class="item" data-action="edit-trade" data-id="${esc(t.id)}">
         <div class="item-main">
-          <div class="name"><span class="badge ${t.type}">${t.type === 'buy' ? '매수' : '매도'}</span> ${esc(s.name)}</div>
-          <div class="sub">${t.date.slice(5).replace('-', '/')} · ${fmtQty(t.qty)}주 × ${fmtPrice(t.price, cur)}</div>
+          <div class="name"><span class="badge ${t.type}">${TYPE_LABEL[t.type]}</span> ${esc(s.name)}${s.asset === 'etf' ? ' <span class="badge etf">ETF</span>' : ''}</div>
+          <div class="sub">${t.date.slice(5).replace('-', '/')} · ${fmtQty(t.qty)}주 × ${fmtPrice(t.price, cur)}${t.type === 'div' ? ' (주당)' : ''}</div>
           ${t.memo ? `<div class="memo-line">${esc(t.memo)}</div>` : ''}
         </div>
         <div class="item-side">
           <div class="val">${fmtMoney(t.qty * t.price, cur)}</div>
-          ${r ? `<div class="sub ${cls(r.r)}">${fmtSigned(r.r, cur)} (${fmtPct(r.pct)})</div>${r.over ? '<div class="sub warn">보유수량 초과</div>' : ''}` : ''}
+          ${r ? (r.div ? `<div class="sub up">세후 ${fmtSigned(r.r, cur)}</div>` : `<div class="sub ${cls(r.r)}">${fmtSigned(r.r, cur)} (${fmtPct(r.pct)})</div>${r.over ? '<div class="sub warn">보유수량 초과</div>' : ''}`) : ''}
         </div></button>`;
     }
     if (open) h += '</section>';
@@ -698,10 +880,11 @@
   // ───────────────────────── 관심종목 ─────────────────────────
   function viewWatch() {
     const list = S.symbols.filter(s => s.watch || s.target || s.stop);
-    let h = `<div class="actions-row"><button class="btn primary" data-action="new-symbol">+ 관심종목 추가</button></div>`;
+    let h = `<div class="actions-row"><button class="btn primary" data-action="new-symbol">+ 관심종목 추가</button></div>` + syncBar();
+    const news = Data.keys().fh ? `<section class="card"><h3>해외 시장 뉴스</h3><div id="mkt-news"><p class="hint">불러오는 중…</p></div></section>` : '';
     if (!list.length) {
       return h + `<section class="card empty"><div class="empty-ico">⭐</div><h3>관심종목이 없어요</h3>
-        <p>목표가와 손절가를 적어두면 현재가와의 거리를 한눈에 볼 수 있어요.</p></section>`;
+        <p>목표가와 손절가를 적어두면 현재가와의 거리를 한눈에 볼 수 있어요.</p></section>` + news;
     }
     h += '<section class="card list">';
     for (const s of list) {
@@ -717,14 +900,24 @@
       }
       h += `<button class="item watch" data-action="symbol" data-id="${esc(s.id)}">
         <div class="item-main">
-          <div class="name">${esc(s.name)} ${s.code ? `<span class="code">${esc(s.code)}</span>` : ''} ${tags.join('')}</div>
+          <div class="name">${esc(s.name)} ${s.asset === 'etf' ? '<span class="badge etf">ETF</span>' : ''}${s.code ? `<span class="code">${esc(s.code)}</span>` : ''} ${tags.join('')}</div>
           <div class="sub">현재가 ${p ? fmtPrice(p, cur) : '미입력'} ${s.priceDate ? `· ${esc(s.priceDate.slice(5).replace('-', '/'))}` : ''}</div>
           <div class="dists">${dist(s.target, '목표')}${dist(s.stop, '손절')}</div>
           ${bar}
           ${s.memo ? `<div class="memo-line">${esc(s.memo)}</div>` : ''}
         </div></button>`;
     }
-    return h + '</section>';
+    return h + '</section>' + news;
+  }
+
+  let mktNews = null;
+  function mountWatch(v) {
+    const box = $('#mkt-news', v);
+    if (!box) return;
+    if (mktNews && Date.now() - mktNews.at < 10 * 60000) { box.innerHTML = newsHtml(mktNews.list); return; }
+    Data.marketNews(Data.keys().fh)
+      .then(list => { mktNews = { at: Date.now(), list }; if (document.body.contains(box)) box.innerHTML = newsHtml(list); })
+      .catch(e => { if (document.body.contains(box)) box.innerHTML = `<p class="warn">${esc(e.message)}</p>`; });
   }
 
   // ───────────────────────── 차트 분석 ─────────────────────────
@@ -743,12 +936,13 @@
         ${S.symbols.map(x => `<option value="${esc(x.id)}" ${x.id === s.id ? 'selected' : ''}>${esc(x.name)} (${x.history.length}일)</option>`).join('')}
       </select></div>`;
     const dataBtns = `<div class="actions-row">
+      ${s.code && hasKey(s.currency) ? '<button class="btn small primary" data-action="fetch-history">↻ 실데이터 불러오기</button>' : ''}
       <button class="btn small" data-action="add-bar">+ 시세 입력</button>
       <button class="btn small" data-action="csv">CSV 붙여넣기</button>
       <button class="btn small ghost" data-action="manage-bars">데이터 관리</button></div>`;
     if (bars.length < 2) {
       return h + `<section class="card empty"><div class="empty-ico">📊</div><h3>차트 데이터가 없어요</h3>
-        <p>일별 시세(종가 또는 시가·고가·저가·종가·거래량)를 직접 입력하거나, 증권사 앱·엑셀에서 복사한 표를 붙여넣으세요.</p>
+        <p>${s.code && hasKey(s.currency) ? '아래 <b>실데이터 불러오기</b>를 누르면 최근 1년 일봉을 가져와요.' : '설정에서 무료 API 키를 넣고 종목코드를 입력하면 1년치 일봉을 자동으로 가져와요.'} 직접 입력하거나 엑셀·증권사 화면의 표를 붙여넣을 수도 있어요.</p>
         <p class="hint">이동평균·MACD 분석은 최소 30일, 60일선까지 보려면 60일 이상의 데이터가 필요해요.</p></section>` + dataBtns;
     }
     const range = S.ui.chartRange;
@@ -997,10 +1191,28 @@
     openSheet('설정', `<form class="form" id="setf">
       <h3>수수료 · 세금 (%)</h3>
       <div class="row2">${numInput('buyFee', '매수 수수료', st.buyFee)}${numInput('sellFee', '매도 수수료', st.sellFee)}</div>
-      ${numInput('sellTax', '매도 거래세 (국내만 적용)', st.sellTax)}
-      <p class="hint">사용하는 증권사 수수료와 현재 증권거래세율로 맞춰주세요. 매매 기록에 수수료를 비워두면 이 값으로 자동 계산해요.</p>
+      ${numInput('sellTax', '매도 거래세 (국내 주식만, ETF 면제)', st.sellTax)}
+      <div class="row2">${numInput('divTax', '배당소득세 (국내)', st.divTax)}${numInput('usDivTax', '배당 원천징수 (해외)', st.usDivTax)}</div>
+      <p class="hint">사용하는 증권사 수수료와 현재 세율로 맞춰주세요. 기록할 때 수수료·세금을 비워두면 이 값으로 자동 계산해요.</p>
       <button class="btn primary block">저장</button>
     </form>
+    <h3>데이터 연결 (무료 API)</h3>
+    <p class="hint">키는 이 기기에만 저장되고 백업에는 포함되지 않아요. 앱이 각 서비스에 직접 요청합니다.</p>
+    <form class="form" id="keyf">
+      <label>공공데이터포털 인증키 · 국내 주식/ETF 시세<input name="gov" autocomplete="off" autocapitalize="off" spellcheck="false" value="${esc(Data.keys().gov || '')}" placeholder="일반 인증키 (Decoding)"></label>
+      <label>Twelve Data API 키 · 해외 주식/ETF 시세<input name="td" autocomplete="off" autocapitalize="off" spellcheck="false" value="${esc(Data.keys().td || '')}"></label>
+      <label>Finnhub API 키 · 해외 종목/시장 뉴스<input name="fh" autocomplete="off" autocapitalize="off" spellcheck="false" value="${esc(Data.keys().fh || '')}"></label>
+      <button class="btn primary block">저장하고 연결 테스트</button>
+      <div id="key-result"></div>
+    </form>
+    <details class="howto"><summary>무료 키 발급 방법</summary>
+      <ol>
+        <li><b>공공데이터포털</b> (국내): <a href="https://www.data.go.kr" target="_blank" rel="noopener">data.go.kr</a> 가입 → <b>금융위원회_주식시세정보</b>와 <b>금융위원회_증권상품시세정보</b>(ETF)를 각각 검색해 <b>활용신청</b> → 마이페이지에서 일반 인증키(Decoding) 복사. 승인 후 반영까지 1~2시간 걸릴 수 있어요. 시세는 전 영업일 종가 기준이에요.</li>
+        <li><b>Twelve Data</b> (해외): <a href="https://twelvedata.com" target="_blank" rel="noopener">twelvedata.com</a> 가입 → API Keys에서 복사. 무료: 분당 8회, 하루 800회.</li>
+        <li><b>Finnhub</b> (해외 뉴스): <a href="https://finnhub.io" target="_blank" rel="noopener">finnhub.io</a> 가입 → Dashboard의 API key 복사.</li>
+      </ol>
+      <p class="hint">국내 공시(DART)·국내 뉴스는 무료 API가 앱(브라우저)의 직접 요청을 막아서, 종목 화면의 바로가기 버튼으로 열어요.</p>
+    </details>
     <h3>백업 · 복원</h3>
     <p class="hint">데이터는 이 기기에만 저장돼요. 휴대폰을 바꾸거나 Safari 데이터를 지우면 사라질 수 있으니 가끔 백업 파일을 저장해 두세요.</p>
     <div class="btn-grid">
@@ -1012,16 +1224,37 @@
       <button class="btn" id="st-sample">샘플 데이터 추가</button>
       <button class="btn danger" id="st-reset">전체 데이터 삭제</button>
     </div>
-    <p class="hint small">주식노트 v1 · 서버 없이 기기에만 저장 · 종목 ${S.symbols.length}개, 매매기록 ${S.trades.length}건</p>`, el => {
+    <p class="hint small">주식노트 v2 · 서버 없이 기기에만 저장 · 종목 ${S.symbols.length}개, 매매기록 ${S.trades.length}건</p>`, el => {
       const f = $('#setf', el);
       f.addEventListener('submit', e => {
         e.preventDefault();
-        for (const k of ['buyFee', 'sellFee', 'sellTax']) {
+        for (const k of ['buyFee', 'sellFee', 'sellTax', 'divTax', 'usDivTax']) {
           const v = num(f[k].value);
-          if (!(v >= 0) || v > 10) return toast('수수료 값을 확인해 주세요 (0~10%)');
+          if (!(v >= 0) || v > (k.endsWith('DivTax') || k === 'divTax' ? 50 : 10)) return toast('수수료·세율 값을 확인해 주세요');
           S.settings[k] = v;
         }
         save(); closeSheet(); render(); toast('설정을 저장했어요');
+      });
+      const kf = $('#keyf', el);
+      kf.addEventListener('submit', async e => {
+        e.preventDefault();
+        const k = { gov: kf.gov.value.trim(), td: kf.td.value.trim(), fh: kf.fh.value.trim() };
+        Data.setKeys(k);
+        const out = $('#key-result', el);
+        const tests = [];
+        if (k.gov) tests.push(['공공데이터포털 (주식)', () => Data.krHistory('005930', 'stock', k.gov, 10).then(r => { if (!r.bars.length || r.kind !== 'stock') throw new Error('주식시세 응답이 비어 있어요. 금융위원회_주식시세정보 활용신청을 확인하세요'); return `삼성전자 ${fmtPrice(r.bars[r.bars.length - 1].c, 'KRW')}원 (${r.bars[r.bars.length - 1].d})`; })]);
+        if (k.gov) tests.push(['공공데이터포털 (ETF)', () => Data.krHistory('069500', 'etf', k.gov, 10).then(r => { if (!r.bars.length || r.kind !== 'etf') throw new Error('ETF 시세가 없어요. 금융위원회_증권상품시세정보 활용신청을 확인하세요'); return `KODEX 200 ${fmtPrice(r.bars[r.bars.length - 1].c, 'KRW')}원 (${r.bars[r.bars.length - 1].d})`; })]);
+        if (k.td) tests.push(['Twelve Data', () => Data.usHistory('SPY', k.td, 2).then(r => `SPY $${fmtPrice(r.bars[r.bars.length - 1].c, 'USD')} (${r.bars[r.bars.length - 1].d})`)]);
+        if (k.fh) tests.push(['Finnhub', () => Data.marketNews(k.fh).then(l => `뉴스 ${l.length}건 수신`)]);
+        if (!tests.length) { out.innerHTML = '<p class="hint">키를 지웠어요.</p>'; render(); return; }
+        out.innerHTML = '<p class="hint">테스트 중…</p>';
+        const rows = [];
+        for (const [name, fn] of tests) {
+          try { rows.push(`<li class="ok">✓ ${esc(name)}: ${esc(await fn())}</li>`); }
+          catch (err) { rows.push(`<li class="bad">✕ ${esc(name)}: ${esc(err.message)}</li>`); }
+        }
+        out.innerHTML = `<ul class="key-tests">${rows.join('')}</ul>`;
+        render();
       });
       $('#bk-export', el).addEventListener('click', openExportSheet);
       $('#bk-import', el).addEventListener('click', openImportSheet);
@@ -1139,7 +1372,7 @@
     if (tab === 'portfolio') v.innerHTML = viewPortfolio();
     else if (tab === 'journal') v.innerHTML = viewJournal();
     else if (tab === 'calc') { v.innerHTML = viewCalc(); mountCalc(v); }
-    else if (tab === 'watch') v.innerHTML = viewWatch();
+    else if (tab === 'watch') { v.innerHTML = viewWatch(); mountWatch(v); }
     else if (tab === 'chart') { v.innerHTML = viewChart(); mountChart(v); }
   }
 
@@ -1164,6 +1397,9 @@
         case 'csv': openCsvSheet(S.ui.chartSymbol); break;
         case 'manage-bars': openManageBars(S.ui.chartSymbol); break;
         case 'apply-levels': applyLevels(S.ui.chartSymbol); break;
+        case 'sync': syncSymbols(S.symbols, { explicit: true }); break;
+        case 'fetch-history': { const s = sym(S.ui.chartSymbol); if (s) syncSymbols([s], { full: true, explicit: true }); break; }
+        case 'open-settings': openSettings(); break;
         case 'calc-add-row':
           if (view._calcRead) view._calcRead();
           if (calc.rows.length < 5) calc.rows.push({ p: '', q: '' });
@@ -1191,6 +1427,14 @@
     window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => chartRedraw && chartRedraw());
     new MutationObserver(() => chartRedraw && chartRedraw()).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
     render();
+    // 앱을 열 때 / 다시 볼 때 30분이 지났으면 자동으로 시세 업데이트
+    const autoSync = () => {
+      if (!anyKey() || syncing || (navigator.onLine === false)) return;
+      if (Date.now() - (S.ui.lastSync || 0) < 30 * 60000) return;
+      syncSymbols(syncTargets(), { quiet: true });
+    };
+    autoSync();
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') autoSync(); });
   }
 
   // 테스트용 노출

@@ -4,7 +4,7 @@
   "private": true,
   "description": "서버 없이 기기에만 저장되는 주식 보조 PWA",
   "scripts": {
-    "test": "node --test tests/indicators.test.js",
+    "test": "node --test tests/indicators.test.js tests/data.test.js",
     "test:ui": "node tests/ui-smoke.cjs",
     "start": "python3 -m http.server 8080"
   }

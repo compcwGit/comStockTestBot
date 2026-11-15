@@ -8,7 +8,7 @@ const out = process.argv[2] || path.join(ROOT, 'dist', 'stocknote.html');
 
 const html = read('index.html');
 const body = html.slice(html.indexOf('<body>') + 6, html.indexOf('<script src='));
-const js = ['js/indicators.js', 'js/chart.js', 'js/app.js'].map(read).join('\n');
+const js = ['js/indicators.js', 'js/chart.js', 'js/data.js', 'js/app.js'].map(read).join('\n');
 if (/<\/script/i.test(js)) throw new Error('JS에 </script 문자열이 있어 인라인할 수 없음');
 
 // 미리보기 페이지에서는 상단 안전영역을 페이지가 이미 비워주므로 헤더 여백을 조정

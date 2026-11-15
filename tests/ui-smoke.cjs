@@ -133,6 +133,66 @@ const server = http.createServer((req, res) => {
   st = await page.evaluate(() => window.StockNote.state);
   assert.equal(st.symbols.length, 2);
 
+  // ── ETF + 분배금 + 실시세(모의 응답) ──
+  const govOk = items => JSON.stringify({ response: { header: { resultCode: '00' }, body: { items: { item: items } } } });
+  await page.route('https://apis.data.go.kr/**', route => {
+    const u = route.request().url();
+    const etf = u.includes('getETFPriceInfo');
+    const code = (u.match(/likeSrtnCd=(\w+)/) || [])[1];
+    const rows = etf && code === '069500'
+      ? [{ basDt: '20261113', srtnCd: '069500', itmsNm: 'KODEX 200', clpr: '36000', mkp: '35800', hipr: '36100', lopr: '35700', trqu: '5000000' },
+         { basDt: '20261112', srtnCd: '069500', itmsNm: 'KODEX 200', clpr: '35500', mkp: '35400', hipr: '35600', lopr: '35300', trqu: '4000000' }]
+      : [];
+    route.fulfill({ status: 200, headers: { 'access-control-allow-origin': '*' }, contentType: 'application/json', body: govOk(rows) });
+  });
+  await page.evaluate(() => localStorage.setItem('stocknote.keys', JSON.stringify({ gov: 'test-key' })));
+  await page.click('.tabbar [data-tab=portfolio]');
+  await page.click('[data-action="new-trade"][data-type="buy"]');
+  await page.selectOption('#tf [name=symbol]', '__new');
+  await page.fill('#tf [name=name]', 'KODEX 200');
+  await page.fill('#tf [name=code]', '069500');
+  await page.selectOption('#tf [name=asset]', 'etf');
+  await page.fill('#tf [name=qty]', '10');
+  await page.fill('#tf [name=price]', '35000');
+  await page.click('#tf button.primary');
+  await page.waitForFunction(() => { const s = window.StockNote.state.symbols.find(x => x.code === '069500'); return s && s.price === 36000; });
+  st = await page.evaluate(() => window.StockNote.state);
+  const etfSym = st.symbols.find(x => x.code === '069500');
+  assert.equal(etfSym.asset, 'etf');
+  assert.equal(etfSym.history.length, 2);
+  // 국내 ETF 매도: 거래세 면제
+  await page.click('[data-action="new-trade"][data-type="sell"]');
+  await page.selectOption('#tf [name=symbol]', etfSym.id);
+  await page.fill('#tf [name=qty]', '2');
+  await page.fill('#tf [name=price]', '36000');
+  await page.click('#tf button.primary');
+  st = await page.evaluate(() => window.StockNote.state);
+  const etfSell = st.trades.find(t => t.symbolId === etfSym.id && t.type === 'sell');
+  assert.ok(Math.abs(etfSell.fee - 72000 * 0.015 / 100) < 1e-6, 'ETF 매도엔 거래세 없이 수수료만');
+  // 분배금
+  await page.click('[data-action="new-trade"][data-type="buy"]');
+  await page.click('#tf .seg label:nth-child(3)');
+  await page.selectOption('#tf [name=symbol]', etfSym.id);
+  await page.fill('#tf [name=qty]', '8');
+  await page.fill('#tf [name=price]', '300');
+  assert.match(await page.textContent('#tf-hint'), /세후 수령 2,030원/);
+  await page.click('#tf button.primary');
+  const inc = await page.evaluate(id => window.StockNote.computeBook().pos.get(id), etfSym.id);
+  assert.ok(Math.abs(inc.income - (2400 - 2400 * 0.154)) < 1e-6);
+  assert.equal(inc.qty, 8);
+  await shot('8-portfolio-etf');
+  await page.click('.tabbar [data-tab=journal]');
+  assert.ok(await page.locator('.badge.div').count() >= 1);
+  // 시세 업데이트 버튼 (키 없는 해외/코드 없는 종목은 안내)
+  await page.click('.tabbar [data-tab=portfolio]');
+  await page.click('[data-action="sync"]');
+  await page.waitForSelector('.sheet .err-list');   // 코드 없는 종목·데이터 없는 샘플 → 결과 안내
+  const errText = await page.textContent('.sheet .err-list');
+  assert.match(errText, /종목코드가 없어/);
+  assert.match(errText, /샘플전자: 시세 데이터가 없어요/);
+  await shot('9-sync-result');
+  await page.click('.sheet .sheet-head [data-close]');
+
   // 모든 탭이 화면 폭 안에 들어오는지 (가로 넘침 시 아이폰에서 화면이 축소되고 탭바가 밀려남)
   for (const tab of ['portfolio', 'journal', 'calc', 'watch', 'chart']) {
     await page.click(`.tabbar [data-tab=${tab}]`);

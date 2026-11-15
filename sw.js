@@ -1,8 +1,8 @@
 /* 오프라인 캐시: 앱 파일을 저장해 두고 인터넷 없이도 실행 */
-const CACHE = 'stocknote-v2';
+const CACHE = 'stocknote-v3';
 const ASSETS = [
   './', './index.html', './style.css', './manifest.webmanifest',
-  './js/indicators.js', './js/chart.js', './js/app.js',
+  './js/indicators.js', './js/chart.js', './js/data.js', './js/app.js',
   './icons/icon.svg', './icons/icon-180.png', './icons/icon-192.png', './icons/icon-512.png',
 ];
 
