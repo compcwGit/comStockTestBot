@@ -169,6 +169,26 @@
     clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), 2200);
   }
 
+  // 앱 내 확인창 (브라우저 confirm 대체)
+  function ask(message, okLabel) {
+    return new Promise(resolve => {
+      const root = $('#dialog-root');
+      const danger = /삭제|초과/.test(message);
+      root.innerHTML = `<div class="backdrop"></div>
+        <div class="dialog" role="alertdialog" aria-modal="true">
+          <p>${esc(message)}</p>
+          <div class="dialog-btns">
+            <button class="btn" data-r="0">취소</button>
+            <button class="btn ${danger ? 'danger-fill' : 'primary'}" data-r="1">${esc(okLabel || (danger ? '삭제' : '확인'))}</button>
+          </div></div>`;
+      root.classList.add('open');
+      const done = v => { root.classList.remove('open'); root.innerHTML = ''; resolve(v); };
+      root.querySelector('.backdrop').addEventListener('click', () => done(false));
+      $$('[data-r]', root).forEach(b => b.addEventListener('click', () => done(b.dataset.r === '1')));
+      root.querySelector('[data-r="1"]').focus();
+    });
+  }
+
   function openSheet(title, body, mount) {
     const root = $('#sheet-root');
     root.innerHTML = `<div class="backdrop" data-close></div>
@@ -364,9 +384,9 @@
         save(); closeSheet(); render(); toast('저장했어요');
       });
       const del = $('#sf-del', el);
-      if (del) del.addEventListener('click', () => {
+      if (del) del.addEventListener('click', async () => {
         const n = S.trades.filter(t => t.symbolId === id).length;
-        if (!confirm(`'${s.name}'을(를) 삭제할까요?${n ? `\n매매기록 ${n}건과 차트 데이터도 함께 삭제됩니다.` : ''}`)) return;
+        if (!(await ask(`'${s.name}'을(를) 삭제할까요?${n ? `\n매매기록 ${n}건과 차트 데이터도 함께 삭제됩니다.` : ''}`))) return;
         S.symbols = S.symbols.filter(x => x.id !== id);
         S.trades = S.trades.filter(t => t.symbolId !== id);
         save(); closeSheet(); render(); toast('삭제했어요');
@@ -431,7 +451,7 @@
       f.addEventListener('change', update);
       update();
 
-      f.addEventListener('submit', e => {
+      f.addEventListener('submit', async e => {
         e.preventDefault();
         const q = num(f.qty.value), p = num(f.price.value);
         if (!(q > 0)) return toast('수량을 확인해 주세요');
@@ -448,7 +468,7 @@
         const fee = Number.isFinite(feeIn) && feeIn >= 0 ? feeIn : feeFor(ty, q * p, s.currency);
         const held = book.pos.get(sid);
         if (ty === 'sell' && (!held || q > held.qty + 1e-9)) {
-          if (!confirm(`보유수량(${fmtQty(held ? held.qty : 0)}주)보다 많이 매도합니다. 초과분은 손익 계산에서 제외돼요. 계속할까요?`)) return;
+          if (!(await ask(`보유수량(${fmtQty(held ? held.qty : 0)}주)보다 많이 매도합니다. 초과분은 손익 계산에서 제외돼요. 계속할까요?`, '계속'))) return;
         }
         const rec = t || { id: uid(), created: Date.now() };
         Object.assign(rec, { symbolId: sid, type: ty, date: parseDate(f.date.value) || today(), qty: q, price: p, fee, memo: f.memo.value });
@@ -457,8 +477,8 @@
         save(); closeSheet(); render(); toast(t ? '수정했어요' : '기록했어요');
       });
       const del = $('#tf-del', el);
-      if (del) del.addEventListener('click', () => {
-        if (!confirm('이 매매 기록을 삭제할까요?')) return;
+      if (del) del.addEventListener('click', async () => {
+        if (!(await ask('이 매매 기록을 삭제할까요?'))) return;
         S.trades = S.trades.filter(x => x.id !== t.id);
         save(); closeSheet(); render(); toast('삭제했어요');
       });
@@ -953,20 +973,20 @@
           save(); render(); openManageBars(id);
         }
       });
-      $('#mb-clear', el).addEventListener('click', () => {
-        if (!confirm('이 종목의 차트 데이터를 모두 삭제할까요?')) return;
+      $('#mb-clear', el).addEventListener('click', async () => {
+        if (!(await ask('이 종목의 차트 데이터를 모두 삭제할까요?'))) return;
         s.history = []; save(); closeSheet(); render(); toast('삭제했어요');
       });
     });
   }
 
-  function applyLevels(id) {
+  async function applyLevels(id) {
     const s = sym(id);
     if (!s || s.history.length < 20) return;
     const A = Ind.analyze(s.history);
     const target = A.latest.bbU && A.latest.bbU > A.latest.close ? A.latest.bbU : A.levels.resist20;
     const round = x => (s.currency === 'KRW' ? Math.round(x) : +x.toFixed(2));
-    if (!confirm(`목표가 ${fmtPrice(round(target), s.currency)}, 손절가 ${fmtPrice(round(A.levels.stop), s.currency)}로 저장할까요?`)) return;
+    if (!(await ask(`목표가 ${fmtPrice(round(target), s.currency)}, 손절가 ${fmtPrice(round(A.levels.stop), s.currency)}로 저장할까요?`, '저장'))) return;
     s.target = round(target); s.stop = round(A.levels.stop);
     save(); render(); toast('목표가·손절가를 저장했어요');
   }
@@ -984,8 +1004,8 @@
     <h3>백업 · 복원</h3>
     <p class="hint">데이터는 이 기기에만 저장돼요. 휴대폰을 바꾸거나 Safari 데이터를 지우면 사라질 수 있으니 가끔 백업 파일을 저장해 두세요.</p>
     <div class="btn-grid">
-      <button class="btn" id="bk-export">백업 파일 저장</button>
-      <label class="btn file-btn">백업 불러오기<input type="file" id="bk-import" accept="application/json,.json"></label>
+      <button class="btn" id="bk-export">백업하기</button>
+      <button class="btn" id="bk-import">백업 불러오기</button>
     </div>
     <h3>기타</h3>
     <div class="btn-grid">
@@ -1003,44 +1023,77 @@
         }
         save(); closeSheet(); render(); toast('설정을 저장했어요');
       });
-      $('#bk-export', el).addEventListener('click', exportBackup);
-      $('#bk-import', el).addEventListener('change', e => importBackup(e.target.files[0]));
+      $('#bk-export', el).addEventListener('click', openExportSheet);
+      $('#bk-import', el).addEventListener('click', openImportSheet);
       $('#st-sample', el).addEventListener('click', () => { closeSheet(); loadSample(); });
-      $('#st-reset', el).addEventListener('click', () => {
-        if (!confirm('모든 종목, 매매기록, 차트 데이터를 삭제할까요? 되돌릴 수 없어요.')) return;
-        if (!confirm('정말 삭제할까요? 백업하지 않았다면 복구할 수 없어요.')) return;
+      $('#st-reset', el).addEventListener('click', async () => {
+        if (!(await ask('모든 종목, 매매기록, 차트 데이터를 삭제할까요? 되돌릴 수 없어요.'))) return;
+        if (!(await ask('정말 삭제할까요? 백업하지 않았다면 복구할 수 없어요.'))) return;
         S = defaults(); save(); closeSheet(); render(); toast('모든 데이터를 삭제했어요');
       });
     });
   }
 
-  async function exportBackup() {
-    const data = JSON.stringify({ app: 'stocknote', exported: new Date().toISOString(), version: S.version, symbols: S.symbols, trades: S.trades, settings: S.settings });
-    const name = `stocknote-backup-${today()}.json`;
-    const file = new File([data], name, { type: 'application/json' });
-    if (navigator.canShare && navigator.canShare({ files: [file] })) {
-      try { await navigator.share({ files: [file], title: '주식노트 백업' }); return; }
-      catch (e) { if (e && e.name === 'AbortError') return; }
-    }
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(file); a.download = name;
-    document.body.appendChild(a); a.click();
-    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+  const backupText = () => JSON.stringify({ app: 'stocknote', exported: new Date().toISOString(), version: S.version, symbols: S.symbols, trades: S.trades, settings: S.settings });
+
+  function openExportSheet() {
+    const data = backupText();
+    openSheet('백업하기', `
+      <p class="hint">파일로 저장하거나, 아래 텍스트를 복사해 메모 앱 등에 붙여넣어 보관하세요. (${(data.length / 1024).toFixed(1)}KB)</p>
+      <div class="btn-grid">
+        <button class="btn primary" id="ex-file">파일로 저장</button>
+        <button class="btn" id="ex-copy">텍스트 복사</button>
+      </div>
+      <textarea id="ex-text" rows="6" readonly spellcheck="false">${esc(data)}</textarea>`, el => {
+      const ta = $('#ex-text', el);
+      $('#ex-copy', el).addEventListener('click', () => {
+        const fallback = () => { ta.focus(); ta.select(); ta.setSelectionRange(0, ta.value.length); toast('텍스트를 선택했어요. 복사를 눌러주세요'); };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(data).then(() => toast('백업 텍스트를 복사했어요'), fallback);
+        } else fallback();
+      });
+      $('#ex-file', el).addEventListener('click', async () => {
+        const name = `stocknote-backup-${today()}.json`;
+        const file = new File([data], name, { type: 'application/json' });
+        if (navigator.canShare && navigator.canShare({ files: [file] })) {
+          try { await navigator.share({ files: [file], title: '주식노트 백업' }); return; }
+          catch (e) { if (e && e.name === 'AbortError') return; }
+        }
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(file); a.download = name;
+        document.body.appendChild(a); a.click();
+        setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+        toast('파일 저장이 안 되면 텍스트 복사를 이용하세요');
+      });
+    });
   }
 
-  function importBackup(file) {
-    if (!file) return;
-    const r = new FileReader();
-    r.onload = () => {
-      try {
-        const obj = JSON.parse(r.result);
-        if (!obj || !Array.isArray(obj.symbols) || !Array.isArray(obj.trades)) throw new Error('형식 오류');
-        const next = normalize({ ...obj, ui: S.ui });
-        if (!confirm(`백업을 불러올까요?\n종목 ${next.symbols.length}개, 매매기록 ${next.trades.length}건\n현재 데이터는 백업 내용으로 바뀝니다.`)) return;
-        S = next; save(); closeSheet(); render(); toast('백업을 불러왔어요');
-      } catch (e) { toast('백업 파일을 읽을 수 없어요'); }
-    };
-    r.readAsText(file);
+  function openImportSheet() {
+    openSheet('백업 불러오기', `
+      <p class="hint">백업 파일을 고르거나, 복사해 둔 백업 텍스트를 붙여넣으세요. 현재 데이터는 백업 내용으로 바뀝니다.</p>
+      <label class="btn file-btn block">백업 파일 선택<input type="file" id="im-file" accept="application/json,.json,text/plain"></label>
+      <label>백업 텍스트<textarea id="im-text" rows="6" spellcheck="false" placeholder='{"app":"stocknote", ...}'></textarea></label>
+      <button class="btn primary block" id="im-go">텍스트로 불러오기</button>`, el => {
+      $('#im-file', el).addEventListener('change', e => {
+        const f = e.target.files[0];
+        if (!f) return;
+        const r = new FileReader();
+        r.onload = () => restoreBackup(r.result);
+        r.readAsText(f);
+      });
+      $('#im-go', el).addEventListener('click', () => restoreBackup($('#im-text', el).value));
+    });
+  }
+
+  async function restoreBackup(text) {
+    let next;
+    try {
+      const obj = JSON.parse(String(text).trim());
+      if (!obj || !Array.isArray(obj.symbols) || !Array.isArray(obj.trades)) throw new Error('형식 오류');
+      next = normalize({ ...obj, ui: S.ui });
+    } catch (e) { return toast('백업 내용을 읽을 수 없어요. 전체를 복사했는지 확인해 주세요'); }
+    if (!(await ask(`백업을 불러올까요?\n종목 ${next.symbols.length}개, 매매기록 ${next.trades.length}건\n현재 데이터는 백업 내용으로 바뀝니다.`, '불러오기'))) return;
+    S = next; save(); closeSheet(); render(); toast('백업을 불러왔어요');
   }
 
   function loadSample() {
@@ -1064,7 +1117,7 @@
     }
     const last = bars[bars.length - 1];
     const sid = uid();
-    S.symbols.push({ id: sid, name: '샘플전자', code: 'DEMO', currency: 'KRW', price: last.c, priceDate: last.d, target: Math.round(last.c * 1.12 / 100) * 100, stop: Math.round(last.c * 0.92 / 100) * 100, memo: '샘플 데이터입니다. 설정 > 종목 정보 수정에서 삭제할 수 있어요.', watch: true, history: bars });
+    S.symbols.push({ id: sid, name: '샘플전자', code: 'DEMO', currency: 'KRW', price: last.c, priceDate: last.d, target: Math.round(last.c * 1.12 / 100) * 100, stop: Math.round(last.c * 0.92 / 100) * 100, memo: '샘플 데이터입니다. 종목을 누른 뒤 '종목 정보 수정 → 종목 삭제'로 지울 수 있어요.', watch: true, history: bars });
     const at = i => bars[i];
     const now = Date.now();
     S.trades.push(
@@ -1136,6 +1189,7 @@
     window.addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(() => chartRedraw && chartRedraw(), 120); });
     document.addEventListener('keydown', e => { if (e.key === 'Escape') closeSheet(); });
     window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => chartRedraw && chartRedraw());
+    new MutationObserver(() => chartRedraw && chartRedraw()).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
     render();
   }
 
